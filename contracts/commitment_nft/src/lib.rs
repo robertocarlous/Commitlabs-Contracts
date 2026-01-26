@@ -39,6 +39,8 @@ pub enum ContractError {
     InvalidCommitmentType = 12,
     /// Invalid amount (must be > 0)
     InvalidAmount = 13,
+    /// Reentrancy detected
+    ReentrancyDetected = 14,
 }
 
 // ============================================================================
@@ -91,6 +93,8 @@ pub enum DataKey {
     AuthorizedMinter(Address),
     /// Active status (token_id -> bool)
     ActiveStatus(u32),
+    /// Reentrancy guard flag
+    ReentrancyGuard,
 }
 
 // Events
@@ -191,6 +195,10 @@ impl CommitmentNFTContract {
     ///
     /// # Returns
     /// The token_id of the newly minted NFT
+    /// 
+    /// # Reentrancy Protection
+    /// Uses checks-effects-interactions pattern. This function only writes to storage
+    /// and doesn't make external calls, but still protected for consistency.
     pub fn mint(
         e: Env,
         owner: Address,
@@ -202,11 +210,42 @@ impl CommitmentNFTContract {
         asset_address: Address,
         early_exit_penalty: u32,
     ) -> Result<u32, ContractError> {
-        // Verify contract is initialized
+        // Reentrancy protection
+        let guard: bool = e.storage()
+            .instance()
+            .get(&DataKey::ReentrancyGuard)
+            .unwrap_or(false);
+        
+        if guard {
+            return Err(ContractError::ReentrancyDetected);
+        }
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+
+        // CHECKS: Verify contract is initialized
         if !e.storage().instance().has(&DataKey::Admin) {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
             return Err(ContractError::NotInitialized);
         }
 
+        // Validate inputs
+        if duration_days == 0 {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+            return Err(ContractError::InvalidDuration);
+        }
+        if max_loss_percent > 100 {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+            return Err(ContractError::InvalidMaxLoss);
+        }
+        if !Self::is_valid_commitment_type(&e, &commitment_type) {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+            return Err(ContractError::InvalidCommitmentType);
+        }
+        if initial_amount <= 0 {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // EFFECTS: Update state
         // Generate unique token_id
         let token_id: u32 = e
             .storage()
@@ -278,6 +317,9 @@ impl CommitmentNFTContract {
         token_ids.push_back(token_id);
         e.storage().instance().set(&DataKey::TokenIds, &token_ids);
 
+        // Clear reentrancy guard
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+
         // Emit mint event
         e.events().publish(
             (symbol_short!("Mint"), token_id, owner.clone()),
@@ -311,13 +353,23 @@ impl CommitmentNFTContract {
     }
 
     /// Transfer NFT to new owner
-    pub fn transfer(
-        e: Env,
-        from: Address,
-        to: Address,
-        token_id: u32,
-    ) -> Result<(), ContractError> {
-        // Require authorization from the sender
+    /// 
+    /// # Reentrancy Protection
+    /// Uses checks-effects-interactions pattern. This function only writes to storage
+    /// and doesn't make external calls, but still protected for consistency.
+    pub fn transfer(e: Env, from: Address, to: Address, token_id: u32) -> Result<(), ContractError> {
+        // Reentrancy protection
+        let guard: bool = e.storage()
+            .instance()
+            .get(&DataKey::ReentrancyGuard)
+            .unwrap_or(false);
+        
+        if guard {
+            return Err(ContractError::ReentrancyDetected);
+        }
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+
+        // CHECKS: Require authorization from the sender
         from.require_auth();
 
         // Get the NFT
@@ -325,10 +377,14 @@ impl CommitmentNFTContract {
             .storage()
             .persistent()
             .get(&DataKey::NFT(token_id))
-            .ok_or(ContractError::TokenNotFound)?;
+            .ok_or_else(|| {
+                e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+                ContractError::TokenNotFound
+            })?;
 
         // Verify ownership
         if nft.owner != from {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
             return Err(ContractError::NotOwner);
         }
 
@@ -336,9 +392,11 @@ impl CommitmentNFTContract {
         // For now, we allow transfers regardless of active status
         // Uncomment below to restrict transfers of active NFTs:
         // if nft.is_active {
+        //     e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
         //     return Err(ContractError::TransferNotAllowed);
         // }
 
+        // EFFECTS: Update state
         // Update owner
         nft.owner = to.clone();
         e.storage().persistent().set(&DataKey::NFT(token_id), &nft);
@@ -386,6 +444,9 @@ impl CommitmentNFTContract {
         e.storage()
             .persistent()
             .set(&DataKey::OwnerTokens(to.clone()), &to_tokens);
+
+        // Clear reentrancy guard
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
 
         // Emit transfer event
         e.events().publish(
@@ -474,28 +535,52 @@ impl CommitmentNFTContract {
     // ========================================================================
 
     /// Mark NFT as settled (after maturity)
+    /// 
+    /// # Reentrancy Protection
+    /// Uses checks-effects-interactions pattern. This function only writes to storage
+    /// and doesn't make external calls, but still protected for consistency.
     pub fn settle(e: Env, token_id: u32) -> Result<(), ContractError> {
-        // Get the NFT
+        // Reentrancy protection
+        let guard: bool = e.storage()
+            .instance()
+            .get(&DataKey::ReentrancyGuard)
+            .unwrap_or(false);
+        
+        if guard {
+            return Err(ContractError::ReentrancyDetected);
+        }
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+
+        // CHECKS: Get the NFT
         let mut nft: CommitmentNFT = e
             .storage()
             .persistent()
             .get(&DataKey::NFT(token_id))
-            .ok_or(ContractError::TokenNotFound)?;
+            .ok_or_else(|| {
+                e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+                ContractError::TokenNotFound
+            })?;
 
         // Check if already settled
         if !nft.is_active {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
             return Err(ContractError::AlreadySettled);
         }
 
         // Verify the commitment has expired
         let current_time = e.ledger().timestamp();
         if current_time < nft.metadata.expires_at {
+            e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
             return Err(ContractError::NotExpired);
         }
 
+        // EFFECTS: Update state
         // Mark as inactive (settled)
         nft.is_active = false;
         e.storage().persistent().set(&DataKey::NFT(token_id), &nft);
+
+        // Clear reentrancy guard
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &false);
 
         // Emit settle event
         e.events()
