@@ -20,6 +20,8 @@ pub enum CommitmentError {
     Unauthorized = 9,
     AlreadyInitialized = 10,
     ReentrancyDetected = 11,
+    NotActive = 12,
+    InvalidStatus = 13,
 }
 
 #[contracttype]
@@ -581,10 +583,6 @@ impl CommitmentCoreContract {
         );
     }
 
-    /// Early exit (with penalty)
-    /// 
-    /// # Reentrancy Protection
-    /// Uses checks-effects-interactions pattern with reentrancy guard.
     pub fn early_exit(e: Env, commitment_id: String, caller: Address) {
         // Reentrancy protection
         require_no_reentrancy(&e);
@@ -598,6 +596,7 @@ impl CommitmentCoreContract {
             });
 
         // Verify caller is owner
+        caller.require_auth();
         if commitment.owner != caller {
             set_reentrancy_guard(&e, false);
             panic!("Unauthorized: caller is not the owner");
@@ -611,25 +610,48 @@ impl CommitmentCoreContract {
         }
 
         // EFFECTS: Calculate penalty and update state before external calls
-        let penalty_percent = commitment.rules.early_exit_penalty;
-        let penalty_amount = (commitment.current_value * penalty_percent as i128) / 100;
+        
+        // Calculate penalty based on current_value
+        // penalty_amount = current_value * (early_exit_penalty / 100)
+        let penalty_percent = commitment.rules.early_exit_penalty as i128;
+        let penalty_amount = (commitment.current_value * penalty_percent) / 100;
+        
+        // Calculate returned amount (what owner receives)
         let returned_amount = commitment.current_value - penalty_amount;
 
+        // Update commitment status to early_exit
         commitment.status = String::from_str(&e, "early_exit");
+        commitment.current_value = 0; // All value has been distributed
         set_commitment(&e, &commitment);
-
-        // INTERACTIONS: External calls (token transfer)
         // Transfer remaining amount (after penalty) to owner
         let contract_address = e.current_contract_address();
         let token_client = token::Client::new(&e, &commitment.asset_address);
-        token_client.transfer(&contract_address, &commitment.owner, &returned_amount);
+        
+        if returned_amount > 0 {
+            token_client.transfer(&contract_address, &commitment.owner, &returned_amount);
+        }
+
+        // Call NFT contract to update NFT status (mark as inactive/early_exited)
+        let nft_contract = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::NftContract)
+            .unwrap_or_else(|| {
+                set_reentrancy_guard(&e, false);
+                panic!("NFT contract not initialized")
+            });
+        
+        // Call settle on NFT to mark it as inactive
+        let mut args = Vec::new(&e);
+        args.push_back(commitment.nft_token_id.into_val(&e));
+        e.invoke_contract::<()>(&nft_contract, &Symbol::new(&e, "settle"), args);
 
         // Clear reentrancy guard
         set_reentrancy_guard(&e, false);
 
-        // Emit early exit event
+        // Emit early exit event with detailed information
         e.events().publish(
-            (symbol_short!("EarlyExt"), commitment_id, caller),
+            (symbol_short!("EarlyExt"), commitment_id.clone(), caller.clone()),
             (penalty_amount, returned_amount, e.ledger().timestamp()),
         );
     }
