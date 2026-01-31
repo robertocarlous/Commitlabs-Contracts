@@ -80,6 +80,15 @@ pub struct CommitmentNFT {
     pub early_exit_penalty: u32,
 }
 
+/// Parameters for batch NFT transfer operations
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferParams {
+    pub from: Address,
+    pub to: Address,
+    pub token_id: u32,
+}
+
 /// Storage keys for the contract
 #[contracttype]
 pub enum DataKey {

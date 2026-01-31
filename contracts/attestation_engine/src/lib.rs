@@ -75,6 +75,28 @@ pub enum DataKey {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attestation {
+    pub commitment_id: String,
+    pub timestamp: u64,
+    pub attestation_type: String, // "health_check", "violation", "fee_generation", "drawdown"
+    pub data: Map<String, String>, // Flexible data structure
+    pub is_compliant: bool,
+    pub verified_by: Address,
+}
+
+/// Parameters for batch attestation operations
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestParams {
+    pub commitment_id: String,
+    pub attestation_type: String,
+    pub data: Map<String, String>,
+    pub is_compliant: bool,
+}
+
+// Import Commitment types from commitment_core (define locally for cross-contract calls)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitmentRules {
     pub duration_days: u32,
     pub max_loss_percent: u32,
@@ -1325,6 +1347,228 @@ impl AttestationEngineContract {
     pub fn get_verifier_statistics(e: Env, verifier: Address) -> u64 {
         let key = DataKey::VerifierAttestationCount(verifier);
         e.storage().instance().get(&key).unwrap_or(0)
+    }
+
+    // ========================================================================
+    // Batch Operations
+    // ========================================================================
+
+    /// Batch attest multiple commitments in a single transaction
+    ///
+    /// # Arguments
+    /// * `caller` - The address recording the attestations (must be authorized verifier)
+    /// * `params_list` - Vector of AttestParams for each attestation
+    /// * `mode` - BatchMode::Atomic or BatchMode::BestEffort
+    ///
+    /// # Returns
+    /// BatchResult with empty results and any errors
+    ///
+    /// # Gas Optimization
+    /// - Batch read of analytics counters
+    /// - Single aggregate counter update at end
+    /// - Batch health metrics updates
+    pub fn batch_attest(
+        e: Env,
+        caller: Address,
+        params_list: Vec<AttestParams>,
+        mode: BatchMode,
+    ) -> BatchResultVoid {
+        // Reentrancy protection
+        if e.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        e.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+
+        // Verify caller signed the transaction
+        caller.require_auth();
+
+        // Check caller is authorized verifier
+        if !Self::is_authorized_verifier(&e, &caller) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code: AttestationError::Unauthorized as u32,
+                context: String::from_str(&e, "not_authorized_verifier"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+
+        // Validate batch size
+        let batch_size = params_list.len();
+        let contract_name = String::from_str(&e, "attestation_engine");
+        if let Err(error_code) = BatchProcessor::enforce_batch_limits(&e, batch_size, Some(contract_name)) {
+            e.storage().instance().remove(&DataKey::ReentrancyGuard);
+            let mut errors = Vec::new(&e);
+            errors.push_back(BatchError {
+                index: 0,
+                error_code,
+                context: String::from_str(&e, "batch_size_validation"),
+            });
+            return BatchResultVoid::failure(&e, errors);
+        }
+
+        let mut errors = Vec::new(&e);
+        let mut results = Vec::new(&e);
+
+        // Read analytics counters once (optimization)
+        let (mut total_attestations, mut total_violations, mut verifier_count) = {
+            let total_att = e.storage().instance().get(&DataKey::TotalAttestations).unwrap_or(0u64);
+            let total_viol = e.storage().instance().get(&DataKey::TotalViolations).unwrap_or(0u64);
+            let verifier_key = DataKey::VerifierAttestationCount(caller.clone());
+            let ver_count = e.storage().instance().get(&verifier_key).unwrap_or(0u64);
+            (total_att, total_viol, ver_count)
+        };
+
+        let timestamp = e.ledger().timestamp();
+        let violation_type = String::from_str(&e, "violation");
+
+        // Process each attestation
+        for i in 0..batch_size {
+            let params = params_list.get(i).unwrap();
+
+            // Validate commitment_id
+            if params.commitment_id.len() == 0 {
+                if mode == BatchMode::Atomic {
+                    e.storage().instance().remove(&DataKey::ReentrancyGuard);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidCommitmentId as u32,
+                        context: String::from_str(&e, "empty_commitment_id"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidCommitmentId as u32,
+                        context: String::from_str(&e, "empty_commitment_id"),
+                    });
+                    continue;
+                }
+            }
+
+            // Validate commitment exists
+            if !Self::commitment_exists(&e, &params.commitment_id) {
+                if mode == BatchMode::Atomic {
+                    e.storage().instance().remove(&DataKey::ReentrancyGuard);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::CommitmentNotFound as u32,
+                        context: String::from_str(&e, "commitment_not_found"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::CommitmentNotFound as u32,
+                        context: String::from_str(&e, "commitment_not_found"),
+                    });
+                    continue;
+                }
+            }
+
+            // Validate attestation type
+            if !Self::is_valid_attestation_type(&e, &params.attestation_type) {
+                if mode == BatchMode::Atomic {
+                    e.storage().instance().remove(&DataKey::ReentrancyGuard);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidAttestationType as u32,
+                        context: String::from_str(&e, "invalid_type"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidAttestationType as u32,
+                        context: String::from_str(&e, "invalid_type"),
+                    });
+                    continue;
+                }
+            }
+
+            // Validate data format
+            if !Self::validate_attestation_data(&e, &params.attestation_type, &params.data) {
+                if mode == BatchMode::Atomic {
+                    e.storage().instance().remove(&DataKey::ReentrancyGuard);
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidAttestationData as u32,
+                        context: String::from_str(&e, "invalid_data"),
+                    });
+                    return BatchResultVoid::failure(&e, errors);
+                } else {
+                    errors.push_back(BatchError {
+                        index: i,
+                        error_code: AttestationError::InvalidAttestationData as u32,
+                        context: String::from_str(&e, "invalid_data"),
+                    });
+                    continue;
+                }
+            }
+
+            // Create attestation record
+            let attestation = Attestation {
+                commitment_id: params.commitment_id.clone(),
+                attestation_type: params.attestation_type.clone(),
+                data: params.data.clone(),
+                timestamp,
+                verified_by: caller.clone(),
+                is_compliant: params.is_compliant,
+            };
+
+            // Store attestation
+            let key = DataKey::Attestations(params.commitment_id.clone());
+            let mut attestations: Vec<Attestation> = e.storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&e));
+            attestations.push_back(attestation.clone());
+            e.storage().persistent().set(&key, &attestations);
+
+            // Update health metrics
+            Self::update_health_metrics(&e, &params.commitment_id, &attestation);
+
+            // Increment attestation counter
+            let counter_key = DataKey::AttestationCounter(params.commitment_id.clone());
+            let counter: u64 = e.storage()
+                .persistent()
+                .get(&counter_key)
+                .unwrap_or(0);
+            e.storage().persistent().set(&counter_key, &(counter + 1));
+
+            // Update analytics counters (in memory)
+            total_attestations += 1;
+            verifier_count += 1;
+            if attestation.attestation_type == violation_type || !attestation.is_compliant {
+                total_violations += 1;
+            }
+
+            results.push_back(());
+
+            // Emit event
+            e.events().publish(
+                (Symbol::new(&e, "AttestationRecorded"), params.commitment_id.clone(), caller.clone()),
+                (params.attestation_type.clone(), params.is_compliant, timestamp)
+            );
+        }
+
+        // Write analytics counters once (optimization)
+        e.storage().instance().set(&DataKey::TotalAttestations, &total_attestations);
+        e.storage().instance().set(&DataKey::TotalViolations, &total_violations);
+        let verifier_key = DataKey::VerifierAttestationCount(caller.clone());
+        e.storage().instance().set(&verifier_key, &verifier_count);
+
+        // Clear reentrancy guard
+        e.storage().instance().remove(&DataKey::ReentrancyGuard);
+
+        // Emit batch event
+        e.events().publish(
+            (Symbol::new(&e, "BatchAttest"), batch_size),
+            (results.len(), errors.len(), timestamp)
+        );
+
+        BatchResultVoid::partial(results.len(), errors)
     }
 
     /// Configure rate limits for this contract's functions (e.g. `attest`).

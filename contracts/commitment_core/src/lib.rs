@@ -115,6 +115,24 @@ pub struct Commitment {
     pub status: String, // "active", "settled", "violated", "early_exit"
 }
 
+/// Parameters for creating a commitment (used in batch operations)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateCommitmentParams {
+    pub owner: Address,
+    pub amount: i128,
+    pub asset_address: Address,
+    pub rules: CommitmentRules,
+}
+
+/// Parameters for updating commitment value (used in batch operations)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateValueParams {
+    pub commitment_id: String,
+    pub new_value: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Allocation {
@@ -313,6 +331,7 @@ fn call_nft_mint(
     commitment_type: &String,
     initial_amount: i128,
     asset_address: &Address,
+    early_exit_penalty: u32,
 ) -> u32 {
     let mut args = Vec::new(e);
     args.push_back(owner.clone().into_val(e));
@@ -322,6 +341,7 @@ fn call_nft_mint(
     args.push_back(commitment_type.clone().into_val(e));
     args.push_back(initial_amount.into_val(e));
     args.push_back(asset_address.clone().into_val(e));
+    args.push_back(early_exit_penalty.into_val(e));
 
     // In Soroban, contract calls return the value directly
     // Failures cause the entire transaction to fail
@@ -694,6 +714,7 @@ impl CommitmentCoreContract {
             &rules.commitment_type,
             amount,
             &asset_address,
+            rules.early_exit_penalty,
         );
 
         // Update commitment with NFT token ID
